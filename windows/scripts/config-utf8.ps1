@@ -303,7 +303,9 @@ function Set-DreamSkinSectionSetting {
   if ($matcher.Matches($Body).Count -gt 1) {
     throw "Refusing to rewrite duplicate '$Key' entries in the [desktop] section."
   }
-  if ($null -eq $Line) { return $matcher.Replace($Body, '', 1) }
+  # Windows PowerShell 5.1 binds $null to String.Empty for a [string] parameter.
+  # An empty value cannot be a complete TOML assignment, so it means remove the key.
+  if ([string]::IsNullOrEmpty($Line)) { return $matcher.Replace($Body, '', 1) }
   $normalizedLine = $Line.TrimEnd("`r", "`n") + $NewLine
   if ($matcher.IsMatch($Body)) {
     $literalReplacement = $normalizedLine.Replace('$', '$$')
