@@ -100,6 +100,7 @@ function Write-DreamSkinBytesAtomically {
   }
   $fileName = [System.IO.Path]::GetFileName($fullPath)
   $temporary = Join-Path $directory ".$fileName.$PID.$([guid]::NewGuid().ToString('N')).tmp"
+  $replacementBackup = Join-Path $directory ".$fileName.$PID.$([guid]::NewGuid().ToString('N')).replace-backup"
   $destinationGuard = $null
 
   try {
@@ -134,13 +135,18 @@ function Write-DreamSkinBytesAtomically {
       }
     }
     if ([System.IO.File]::Exists($fullPath)) {
-      [System.IO.File]::Replace($temporary, $fullPath, $null)
+      # Windows PowerShell 5.1 binds a null third argument as an invalid empty path.
+      # A unique same-directory backup keeps Replace atomic and avoids that binder ambiguity.
+      [System.IO.File]::Replace($temporary, $fullPath, $replacementBackup)
     } else {
       [System.IO.File]::Move($temporary, $fullPath)
     }
   } finally {
     if ($null -ne $destinationGuard) { $destinationGuard.Dispose() }
     if ([System.IO.File]::Exists($temporary)) { [System.IO.File]::Delete($temporary) }
+    if ([System.IO.File]::Exists($replacementBackup)) {
+      try { [System.IO.File]::Delete($replacementBackup) } catch {}
+    }
   }
 }
 
