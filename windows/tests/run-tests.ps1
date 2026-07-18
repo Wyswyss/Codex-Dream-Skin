@@ -542,6 +542,12 @@ try {
     -not (Test-Path -LiteralPath $node.Path -PathType Leaf)) {
     throw 'Node runtime discovery did not return a real Windows executable.'
   }
+  $windowsPowerShell = Get-DreamSkinWindowsPowerShellPath
+  if ([System.IO.Path]::GetFileName($windowsPowerShell) -ine 'powershell.exe' -or
+    -not [System.IO.Path]::IsPathRooted($windowsPowerShell) -or
+    -not (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf)) {
+    throw 'Windows PowerShell discovery did not return a trusted executable path.'
+  }
 
   $powerShellSources = @(Get-ChildItem -LiteralPath $Root -Filter '*.ps1' -File -Recurse)
   foreach ($powerShellSource in $powerShellSources) {

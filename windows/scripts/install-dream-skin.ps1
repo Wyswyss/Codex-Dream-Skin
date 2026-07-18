@@ -50,8 +50,7 @@ try {
       $shell = New-Object -ComObject WScript.Shell
       $desktop = [Environment]::GetFolderPath('Desktop')
       $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
-      $powershellCommand = Get-Command powershell.exe -CommandType Application -ErrorAction Stop
-      $powershell = $powershellCommand.Source
+      $powershell = Get-DreamSkinWindowsPowerShellPath
       $startScript = Join-Path $PSScriptRoot 'start-dream-skin.ps1'
       $restoreScript = Join-Path $PSScriptRoot 'restore-dream-skin.ps1'
       $shortcutStageRoot = Join-Path $StateRoot "shortcut-stage-$([guid]::NewGuid().ToString('N'))"

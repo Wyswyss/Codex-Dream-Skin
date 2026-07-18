@@ -132,6 +132,19 @@ function Invoke-DreamSkinNodeExpression {
   }
 }
 
+function Get-DreamSkinWindowsPowerShellPath {
+  $systemPowerShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+  foreach ($candidate in @((Join-Path $PSHOME 'powershell.exe'), $systemPowerShell)) {
+    $fullPath = [System.IO.Path]::GetFullPath($candidate)
+    if ([System.IO.Path]::IsPathRooted($fullPath) -and
+      [System.IO.Path]::GetFileName($fullPath) -ieq 'powershell.exe' -and
+      (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+      return $fullPath
+    }
+  }
+  throw 'A trusted Windows PowerShell executable could not be found.'
+}
+
 function Get-DreamSkinNodeRuntime {
   param([int]$MinimumMajor = 22)
 
