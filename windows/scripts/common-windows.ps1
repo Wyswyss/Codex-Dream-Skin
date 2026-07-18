@@ -135,21 +135,18 @@ function Invoke-DreamSkinNodeExpression {
 function Get-DreamSkinNodeRuntime {
   param([int]$MinimumMajor = 22)
 
-  $command = Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue
-  if (-not $command) { $command = Get-Command node -CommandType Application -ErrorAction SilentlyContinue }
-  if (-not $command) { throw "Node.js $MinimumMajor or newer is required and was not found in PATH." }
-  $commandPath = if ($command.Path) { "$($command.Path)" } else { "$($command.Source)" }
+  $commands = @(Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue)
+  if ($commands.Count -eq 0) {
+    $commands = @(Get-Command node -CommandType Application -ErrorAction SilentlyContinue)
+  }
+  if ($commands.Count -eq 0) { throw "Node.js $MinimumMajor or newer is required and was not found in PATH." }
+  # Windows PowerShell can return every matching application on PATH. Use its first-choice candidate.
+  $command = $commands[0]
+  $commandPath = if ($command.Path) { [string]$command.Path } else { [string]$command.Source }
   if (-not [System.IO.Path]::IsPathRooted($commandPath) -or
     [System.IO.Path]::GetExtension($commandPath) -ine '.exe' -or
     -not (Test-Path -LiteralPath $commandPath -PathType Leaf)) {
-    $commandType = $command.GetType().FullName
-    $commandCount = @($command).Count
-    $pathBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($commandPath))
-    $sourceBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("$($command.Source)"))
-    $isRooted = [System.IO.Path]::IsPathRooted($commandPath)
-    $extension = [System.IO.Path]::GetExtension($commandPath)
-    $exists = Test-Path -LiteralPath $commandPath -PathType Leaf
-    throw "The Node.js command in PATH is not a real Windows executable. Type=$commandType Count=$commandCount PathBase64=$pathBase64 SourceBase64=$sourceBase64 Rooted=$isRooted Extension=$extension Exists=$exists"
+    throw 'The Node.js command in PATH is not a real Windows executable.'
   }
   $version = Invoke-DreamSkinNodeExpression -NodePath $commandPath -Expression 'process.versions.node'
   $runtimePath = Invoke-DreamSkinNodeExpression -NodePath $commandPath -Expression 'process.execPath'
