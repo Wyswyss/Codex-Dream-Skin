@@ -542,10 +542,21 @@ try {
     -not (Test-Path -LiteralPath $node.Path -PathType Leaf)) {
     throw 'Node runtime discovery did not return a real Windows executable.'
   }
-  $windowsPowerShell = Get-DreamSkinWindowsPowerShellPath
+  $fakePowerShellDirectory = Join-Path $temporaryRoot 'fake-powershell-path'
+  $fakePowerShell = Join-Path $fakePowerShellDirectory 'powershell.exe'
+  New-Item -ItemType Directory -Path $fakePowerShellDirectory | Out-Null
+  [System.IO.File]::WriteAllBytes($fakePowerShell, [byte[]]@())
+  $savedPath = $env:PATH
+  try {
+    $env:PATH = "$fakePowerShellDirectory$([System.IO.Path]::PathSeparator)$savedPath"
+    $windowsPowerShell = Get-DreamSkinWindowsPowerShellPath
+  } finally {
+    $env:PATH = $savedPath
+  }
   if ([System.IO.Path]::GetFileName($windowsPowerShell) -ine 'powershell.exe' -or
     -not [System.IO.Path]::IsPathRooted($windowsPowerShell) -or
-    -not (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf)) {
+    -not (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf) -or
+    (Test-DreamSkinPathEqual -Left $windowsPowerShell -Right $fakePowerShell)) {
     throw 'Windows PowerShell discovery did not return a trusted executable path.'
   }
 

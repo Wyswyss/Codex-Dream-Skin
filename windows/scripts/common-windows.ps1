@@ -133,13 +133,17 @@ function Invoke-DreamSkinNodeExpression {
 }
 
 function Get-DreamSkinWindowsPowerShellPath {
-  $systemPowerShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
-  foreach ($candidate in @((Join-Path $PSHOME 'powershell.exe'), $systemPowerShell)) {
-    $fullPath = [System.IO.Path]::GetFullPath($candidate)
-    if ([System.IO.Path]::IsPathRooted($fullPath) -and
-      [System.IO.Path]::GetFileName($fullPath) -ieq 'powershell.exe' -and
-      (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
-      return $fullPath
+  $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+  $systemPowerShell = Join-Path $systemDirectory 'WindowsPowerShell\v1.0\powershell.exe'
+  $candidates = @($systemPowerShell)
+  if ($PSVersionTable.PSEdition -ceq 'Desktop') {
+    $candidates = @((Join-Path $PSHOME 'powershell.exe'), $systemPowerShell)
+  }
+  foreach ($candidate in $candidates) {
+    if ($candidate -and [System.IO.Path]::IsPathRooted($candidate) -and
+      [System.IO.Path]::GetFileName($candidate) -ieq 'powershell.exe' -and
+      [System.IO.File]::Exists($candidate)) {
+      return [System.IO.Path]::GetFullPath($candidate)
     }
   }
   throw 'A trusted Windows PowerShell executable could not be found.'
