@@ -142,7 +142,14 @@ function Get-DreamSkinNodeRuntime {
   if (-not [System.IO.Path]::IsPathRooted($commandPath) -or
     [System.IO.Path]::GetExtension($commandPath) -ine '.exe' -or
     -not (Test-Path -LiteralPath $commandPath -PathType Leaf)) {
-    throw 'The Node.js command in PATH is not a real Windows executable.'
+    $commandType = $command.GetType().FullName
+    $commandCount = @($command).Count
+    $pathBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($commandPath))
+    $sourceBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("$($command.Source)"))
+    $isRooted = [System.IO.Path]::IsPathRooted($commandPath)
+    $extension = [System.IO.Path]::GetExtension($commandPath)
+    $exists = Test-Path -LiteralPath $commandPath -PathType Leaf
+    throw "The Node.js command in PATH is not a real Windows executable. Type=$commandType Count=$commandCount PathBase64=$pathBase64 SourceBase64=$sourceBase64 Rooted=$isRooted Extension=$extension Exists=$exists"
   }
   $version = Invoke-DreamSkinNodeExpression -NodePath $commandPath -Expression 'process.versions.node'
   $runtimePath = Invoke-DreamSkinNodeExpression -NodePath $commandPath -Expression 'process.execPath'
