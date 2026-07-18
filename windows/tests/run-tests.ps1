@@ -89,8 +89,11 @@ try {
     throw 'A commented or quoted desktop table was duplicated during install.'
   }
   Restore-DreamSkinBaseTheme -ConfigPath $quotedConfigPath -BackupPath $quotedBackupPath
-  if ((Read-DreamSkinUtf8File -Path $quotedConfigPath) -cne $quotedOriginal) {
-    throw 'Quoted desktop keys or a table-header comment were not restored exactly.'
+  $quotedRestored = Read-DreamSkinUtf8File -Path $quotedConfigPath
+  if ($quotedRestored -cne $quotedOriginal) {
+    $expectedBase64 = [Convert]::ToBase64String($utf8NoBom.GetBytes($quotedOriginal))
+    $actualBase64 = [Convert]::ToBase64String($utf8NoBom.GetBytes($quotedRestored))
+    throw "Quoted desktop keys or a table-header comment were not restored exactly. ExpectedBase64=$expectedBase64 ActualBase64=$actualBase64"
   }
 
   $singleLineArrayPath = Join-Path $temporaryRoot 'config-single-line-array.toml'
