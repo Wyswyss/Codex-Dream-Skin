@@ -1,4 +1,4 @@
-((cssText, artDataUrl) => {
+((cssText, artDataUrl, skinVersion) => {
   const STATE_KEY = "__CODEX_DREAM_SKIN_STATE__";
   const STYLE_ID = "codex-dream-skin-style";
   const CHROME_ID = "codex-dream-skin-chrome";
@@ -108,7 +108,7 @@
   const observer = new MutationObserver(scheduleEnsure);
   observer.observe(document.documentElement, { childList: true, subtree: true });
   const timer = setInterval(ensure, 5000);
-  window[STATE_KEY] = { ensure, cleanup, observer, timer, scheduler, artUrl, version: "1.0.0" };
+  window[STATE_KEY] = { ensure, cleanup, observer, timer, scheduler, artUrl, version: skinVersion };
   ensure();
-  return { installed: true, version: "1.0.0" };
-})(__DREAM_CSS_JSON__, __DREAM_ART_JSON__)
+  return { installed: true, version: skinVersion };
+})(__DREAM_CSS_JSON__, __DREAM_ART_JSON__, __DREAM_VERSION_JSON__)

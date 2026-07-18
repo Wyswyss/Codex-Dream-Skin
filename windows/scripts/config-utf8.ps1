@@ -100,11 +100,38 @@ function Write-DreamSkinBytesAtomically {
   }
   $fileName = [System.IO.Path]::GetFileName($fullPath)
   $temporary = Join-Path $directory ".$fileName.$PID.$([guid]::NewGuid().ToString('N')).tmp"
+  $destinationGuard = $null
 
   try {
     [System.IO.File]::WriteAllBytes($temporary, $Bytes)
     if ($PSBoundParameters.ContainsKey('ExpectedBytes')) {
-      Assert-DreamSkinFileUnchanged -Path $fullPath -ExpectedBytes $ExpectedBytes
+      if ([System.IO.File]::Exists($fullPath)) {
+        if ($null -eq $ExpectedBytes) {
+          throw "File changed during the operation; retry without other writers: $fullPath"
+        }
+        $share = [System.IO.FileShare]::Read -bor [System.IO.FileShare]::Delete
+        $destinationGuard = [System.IO.File]::Open(
+          $fullPath,
+          [System.IO.FileMode]::Open,
+          [System.IO.FileAccess]::Read,
+          $share
+        )
+        if ($destinationGuard.Length -gt [int]::MaxValue) {
+          throw "File is too large for a conditional replacement: $fullPath"
+        }
+        $currentBytes = New-Object byte[] ([int]$destinationGuard.Length)
+        $offset = 0
+        while ($offset -lt $currentBytes.Length) {
+          $read = $destinationGuard.Read($currentBytes, $offset, $currentBytes.Length - $offset)
+          if ($read -le 0) { throw "File could not be read completely before replacement: $fullPath" }
+          $offset += $read
+        }
+        if (-not (Test-DreamSkinBytesEqual -Left $ExpectedBytes -Right $currentBytes)) {
+          throw "File changed during the operation; retry without other writers: $fullPath"
+        }
+      } elseif ($null -ne $ExpectedBytes) {
+        throw "File disappeared during the operation; retry: $fullPath"
+      }
     }
     if ([System.IO.File]::Exists($fullPath)) {
       [System.IO.File]::Replace($temporary, $fullPath, $null)
@@ -112,6 +139,7 @@ function Write-DreamSkinBytesAtomically {
       [System.IO.File]::Move($temporary, $fullPath)
     }
   } finally {
+    if ($null -ne $destinationGuard) { $destinationGuard.Dispose() }
     if ([System.IO.File]::Exists($temporary)) { [System.IO.File]::Delete($temporary) }
   }
 }
@@ -286,7 +314,9 @@ function Install-DreamSkinBaseTheme {
     [string]$ConfigPath,
 
     [Parameter(Mandatory = $true)]
-    [string]$BackupPath
+    [string]$BackupPath,
+
+    [switch]$PassThru
   )
 
   if (-not (Test-Path -LiteralPath $ConfigPath)) { throw "Codex config not found: $ConfigPath" }
@@ -327,6 +357,14 @@ function Install-DreamSkinBaseTheme {
       Remove-Item -LiteralPath $BackupPath -Force -ErrorAction SilentlyContinue
     }
     throw
+  }
+
+  if ($PassThru) {
+    return [pscustomobject]@{
+      OriginalBytes = $originalBytes
+      InstalledBytes = $script:DreamSkinUtf8NoBom.GetBytes($content)
+      BackupCreated = $backupCreated
+    }
   }
 }
 
