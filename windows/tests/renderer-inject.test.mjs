@@ -9,7 +9,8 @@ const windowsRoot = path.resolve(here, "..");
 const template = await fs.readFile(path.join(windowsRoot, "assets", "renderer-inject.js"), "utf8");
 const payload = template
   .replace("__DREAM_CSS_JSON__", JSON.stringify(".fixture { color: blue; }"))
-  .replace("__DREAM_ART_JSON__", JSON.stringify("data:image/png;base64,AA=="));
+  .replace("__DREAM_ART_JSON__", JSON.stringify("data:image/png;base64,AA=="))
+  .replace("__DREAM_VERSION_JSON__", JSON.stringify("test-version"));
 
 function createFixture({ shellPresent, staleSkin = false }) {
   const nodes = new Map();

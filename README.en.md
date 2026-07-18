@@ -91,7 +91,7 @@ One image, one mood. Real theme previews you can ship:
 - **Real UI** — Sidebar, cards, project picker, and input stay native. Not a fake full-window screenshot.
 - **Swappable art** — Drop in an image you like and it becomes your theme.
 - **Restorable** — One-click restore to the stock look.
-- **Safer path** — Local-loopback CDP inject only. No official binary or signature changes.
+- **Windows secure mode** — CDP travels over inherited anonymous pipes, with no TCP debug port and no official binary or signature changes.
 
 ## Quick start
 
@@ -101,6 +101,8 @@ Platform scripts are ready — different plumbing, same goal: theme Codex.
 |------|------|------|
 | Apple Silicon / Intel Mac | [`macos/`](./macos/) | Double-click `Install Codex Dream Skin.command` |
 | Windows | [`windows/`](./windows/) | `scripts/install-dream-skin.ps1` → `start-dream-skin.ps1` |
+
+Windows requires Node.js 22 or newer. Its Node supervisor starts the currently registered official Store package directly and must remain alive for the themed session; stopping the supervisor closes that Codex instance. Secure mode never falls back to TCP.
 
 More detail:
 
@@ -116,8 +118,11 @@ More detail:
 
 ## Safety
 
-- CDP binds `127.0.0.1` only — avoid untrusted local processes while the theme runs.
+- **Windows:** CDP uses the inherited `--remote-debugging-pipe` only. There is no TCP listener, unauthenticated localhost port, or port-mode fallback. Verify reads atomic, session-bound local status with freshness checks and validates the Node and Store Codex process identities. Secure mode cannot open a second CDP connection for screenshots, so final visual signoff remains a manual live-Windows check.
+- **macOS:** The current upstream implementation still uses loopback CDP on `127.0.0.1`. That prevents LAN access, but it does not authenticate other processes running as the same user; avoid untrusted local software while the theme runs.
+- Pipe mode reduces exposure; it is not a security boundary against malware already able to run as the same Windows user, duplicate process handles, or inject into a process.
 - Does not touch the official install directory or code signature.
+- Windows config edits are limited to known appearance keys in `config.toml`, with byte-preserving backup and recovery; Appx / WindowsApps remains untouched.
 - **Never** rewrites API Key / Base URL; relay and theme stay separate.
 
 ## License

@@ -100,19 +100,53 @@ function Write-DreamSkinBytesAtomically {
   }
   $fileName = [System.IO.Path]::GetFileName($fullPath)
   $temporary = Join-Path $directory ".$fileName.$PID.$([guid]::NewGuid().ToString('N')).tmp"
+  $replacementBackup = Join-Path $directory ".$fileName.$PID.$([guid]::NewGuid().ToString('N')).replace-backup"
+  $destinationGuard = $null
 
   try {
     [System.IO.File]::WriteAllBytes($temporary, $Bytes)
     if ($PSBoundParameters.ContainsKey('ExpectedBytes')) {
-      Assert-DreamSkinFileUnchanged -Path $fullPath -ExpectedBytes $ExpectedBytes
+      if ([System.IO.File]::Exists($fullPath)) {
+        if ($null -eq $ExpectedBytes) {
+          throw "File changed during the operation; retry without other writers: $fullPath"
+        }
+        $share = [System.IO.FileShare]::Read -bor [System.IO.FileShare]::Delete
+        $destinationGuard = [System.IO.File]::Open(
+          $fullPath,
+          [System.IO.FileMode]::Open,
+          [System.IO.FileAccess]::Read,
+          $share
+        )
+        if ($destinationGuard.Length -gt [int]::MaxValue) {
+          throw "File is too large for a conditional replacement: $fullPath"
+        }
+        $currentBytes = New-Object byte[] ([int]$destinationGuard.Length)
+        $offset = 0
+        while ($offset -lt $currentBytes.Length) {
+          $read = $destinationGuard.Read($currentBytes, $offset, $currentBytes.Length - $offset)
+          if ($read -le 0) { throw "File could not be read completely before replacement: $fullPath" }
+          $offset += $read
+        }
+        if (-not (Test-DreamSkinBytesEqual -Left $ExpectedBytes -Right $currentBytes)) {
+          throw "File changed during the operation; retry without other writers: $fullPath"
+        }
+      } elseif ($null -ne $ExpectedBytes) {
+        throw "File disappeared during the operation; retry: $fullPath"
+      }
     }
     if ([System.IO.File]::Exists($fullPath)) {
-      [System.IO.File]::Replace($temporary, $fullPath, $null)
+      # Windows PowerShell 5.1 binds a null third argument as an invalid empty path.
+      # A unique same-directory backup keeps Replace atomic and avoids that binder ambiguity.
+      [System.IO.File]::Replace($temporary, $fullPath, $replacementBackup)
     } else {
       [System.IO.File]::Move($temporary, $fullPath)
     }
   } finally {
+    if ($null -ne $destinationGuard) { $destinationGuard.Dispose() }
     if ([System.IO.File]::Exists($temporary)) { [System.IO.File]::Delete($temporary) }
+    if ([System.IO.File]::Exists($replacementBackup)) {
+      try { [System.IO.File]::Delete($replacementBackup) } catch {}
+    }
   }
 }
 
@@ -167,7 +201,8 @@ function Assert-DreamSkinTomlLineEditingSafe {
   if ($Content.Contains('"""') -or $Content.Contains("'''")) {
     throw 'Refusing to rewrite TOML containing multiline strings; use single-line values before installing Dream Skin.'
   }
-  foreach ($match in [regex]::Matches($Content, '(?m)^[^\r\n]*=[\t ]*\[[^\r\n]*$')) {
+  # Match a logical line before its optional CR; multiline `$` alone sits after CR on Windows.
+  foreach ($match in [regex]::Matches($Content, '(?m)^[^\r\n]*=[\t ]*\[[^\r\n]*(?=\r?$)')) {
     if ((Get-DreamSkinTomlArrayBracketBalance -Line $match.Value) -ne 0) {
       throw 'Refusing to rewrite TOML containing multiline arrays; use single-line arrays before installing Dream Skin.'
     }
@@ -269,7 +304,9 @@ function Set-DreamSkinSectionSetting {
   if ($matcher.Matches($Body).Count -gt 1) {
     throw "Refusing to rewrite duplicate '$Key' entries in the [desktop] section."
   }
-  if ($null -eq $Line) { return $matcher.Replace($Body, '', 1) }
+  # Windows PowerShell 5.1 binds $null to String.Empty for a [string] parameter.
+  # An empty value cannot be a complete TOML assignment, so it means remove the key.
+  if ([string]::IsNullOrEmpty($Line)) { return $matcher.Replace($Body, '', 1) }
   $normalizedLine = $Line.TrimEnd("`r", "`n") + $NewLine
   if ($matcher.IsMatch($Body)) {
     $literalReplacement = $normalizedLine.Replace('$', '$$')
@@ -286,7 +323,9 @@ function Install-DreamSkinBaseTheme {
     [string]$ConfigPath,
 
     [Parameter(Mandatory = $true)]
-    [string]$BackupPath
+    [string]$BackupPath,
+
+    [switch]$PassThru
   )
 
   if (-not (Test-Path -LiteralPath $ConfigPath)) { throw "Codex config not found: $ConfigPath" }
@@ -327,6 +366,14 @@ function Install-DreamSkinBaseTheme {
       Remove-Item -LiteralPath $BackupPath -Force -ErrorAction SilentlyContinue
     }
     throw
+  }
+
+  if ($PassThru) {
+    return [pscustomobject]@{
+      OriginalBytes = $originalBytes
+      InstalledBytes = $script:DreamSkinUtf8NoBom.GetBytes($content)
+      BackupCreated = $backupCreated
+    }
   }
 }
 

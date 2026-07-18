@@ -1,281 +1,203 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import {
+  CdpPipeConnection,
+  CdpPipeSession,
+  NulDelimitedPipeTransport,
+} from "./pipe-transport.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
-const SKIN_VERSION = "1.0.0";
-const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
-const BROWSER_ID_PATTERN = /^[A-Za-z0-9._-]{1,200}$/;
-
-class CdpIdentityMismatchError extends Error {}
+const SKIN_VERSION = "1.1.0-secure-pipe.2";
+const TARGET_ID_PATTERN = /^[A-Za-z0-9._-]{1,200}$/;
+const SESSION_ID_PATTERN = /^[A-Za-z0-9._-]{16,200}$/;
+const ZERO_HEALTHY_TARGET_GRACE_MS = 30000;
+// These hashes are a review boundary. Update one only after reviewing that asset's exact diff.
+const ASSET_SHA256 = Object.freeze({
+  "dream-skin.css": "a85bd61d699496928ab19a5d9ea6d1aaaaeedd4bbfb48e37d873854480b53fff",
+  "renderer-inject.js": "6d8498150980d95a34768ed63f24a148518e93aebbd3832ee96e7d7c8eaaba75",
+  "dream-reference.png": "e6019a268915194e270d9ad4eb44d99c1a43c22c11463137147d9e00428375fc",
+});
+const UNSAFE_CHILD_ENVIRONMENT_KEYS = new Set([
+  "ALL_PROXY",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "SSL_CERT_DIR",
+  "SSL_CERT_FILE",
+]);
+const UNSAFE_CHILD_ENVIRONMENT_PREFIXES = [
+  "CHROME_",
+  "DYLD_",
+  "ELECTRON_",
+  "LD_",
+  "NODE_",
+  "OPENSSL_",
+];
 
 function parseArgs(argv) {
   const options = {
-    port: 9335,
     mode: "watch",
-    timeoutMs: 30000,
-    screenshot: null,
-    reload: false,
-    browserId: null,
+    codexExe: null,
+    handshakePath: null,
+    statusPath: null,
+    sessionId: null,
+    profilePath: null,
+    timeoutMs: 45000,
   };
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
-    if (arg === "--port") options.port = Number(argv[++i]);
-    else if (arg === "--once") options.mode = "once";
-    else if (arg === "--watch") options.mode = "watch";
-    else if (arg === "--verify") options.mode = "verify";
-    else if (arg === "--remove") options.mode = "remove";
-    else if (arg === "--timeout-ms") options.timeoutMs = Number(argv[++i]);
-    else if (arg === "--browser-id") options.browserId = argv[++i];
-    else if (arg === "--screenshot") options.screenshot = path.resolve(argv[++i]);
-    else if (arg === "--reload") options.reload = true;
-    else if (arg === "--self-test") options.mode = "self-test";
-    else if (arg === "--check-payload") options.mode = "check-payload";
-    else throw new Error(`Unknown argument: ${arg}`);
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument === "--watch") options.mode = "watch";
+    else if (argument === "--codex-exe") options.codexExe = path.resolve(argv[++index]);
+    else if (argument === "--handshake") options.handshakePath = path.resolve(argv[++index]);
+    else if (argument === "--status") options.statusPath = path.resolve(argv[++index]);
+    else if (argument === "--session-id") options.sessionId = argv[++index];
+    else if (argument === "--profile-path") options.profilePath = path.resolve(argv[++index]);
+    else if (argument === "--timeout-ms") options.timeoutMs = Number(argv[++index]);
+    else if (argument === "--self-test") options.mode = "self-test";
+    else if (argument === "--check-payload") options.mode = "check-payload";
+    else throw new Error(`Unknown argument: ${argument}`);
   }
-  if (!Number.isInteger(options.port) || options.port < 1024 || options.port > 65535) {
-    throw new Error(`Invalid port: ${options.port}`);
-  }
-  if (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 250 || options.timeoutMs > 120000) {
+
+  if (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 1000 || options.timeoutMs > 120000) {
     throw new Error(`Invalid timeout: ${options.timeoutMs}`);
   }
-  if (options.browserId !== null && !BROWSER_ID_PATTERN.test(options.browserId)) {
-    throw new Error(`Invalid browser ID: ${options.browserId}`);
-  }
-  if (["watch", "once", "verify", "remove"].includes(options.mode) && !options.browserId) {
-    throw new Error(`--browser-id is required in ${options.mode} mode`);
+  if (options.mode === "watch") {
+    if (!options.codexExe || !path.isAbsolute(options.codexExe)) throw new Error("--codex-exe must be absolute");
+    if (!options.handshakePath || !path.isAbsolute(options.handshakePath)) throw new Error("--handshake must be absolute");
+    if (!options.statusPath || !path.isAbsolute(options.statusPath)) throw new Error("--status must be absolute");
+    if (!SESSION_ID_PATTERN.test(options.sessionId ?? "")) throw new Error("--session-id is invalid");
+    if (options.profilePath && !path.isAbsolute(options.profilePath)) throw new Error("--profile-path must be absolute");
   }
   return options;
 }
 
-function validatedDebuggerUrl(target, port) {
-  const url = new URL(target.webSocketDebuggerUrl);
-  const pathIsValid = /^\/devtools\/(?:page|browser)\/[A-Za-z0-9._-]{1,200}$/.test(url.pathname);
-  if (url.protocol !== "ws:" || !LOOPBACK_HOSTS.has(url.hostname) || Number(url.port) !== port ||
-      url.username || url.password || url.search || url.hash || !pathIsValid) {
-    throw new Error("Rejected a CDP WebSocket URL outside the allowed loopback endpoint shape");
-  }
-  return url.href;
-}
-
-function browserIdFromVersion(version, port) {
-  const url = validatedDebuggerUrl(version, port);
-  const parsed = new URL(url);
-  const match = parsed.pathname.match(/^\/devtools\/browser\/([A-Za-z0-9._-]{1,200})$/);
-  if (!match || parsed.search || parsed.hash || !BROWSER_ID_PATTERN.test(match[1])) {
-    throw new Error("Rejected an invalid CDP browser identity URL");
-  }
-  return match[1];
-}
-
-function isValidCdpPageTarget(item, port) {
-  if (item?.type !== "page" || !item.url?.startsWith("app://") || typeof item.id !== "string" ||
-      !BROWSER_ID_PATTERN.test(item.id) || !item.webSocketDebuggerUrl) return false;
+async function writeJsonAtomically(outputPath, value) {
+  await fs.mkdir(path.dirname(outputPath), { recursive: true });
+  const temporary = path.join(
+    path.dirname(outputPath),
+    `.${path.basename(outputPath)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
+  );
   try {
-    const debuggerUrl = new URL(validatedDebuggerUrl(item, port));
-    return debuggerUrl.pathname === `/devtools/page/${item.id}`;
-  } catch {
-    return false;
-  }
-}
-
-class CdpSession {
-  constructor(target, port) {
-    this.target = target;
-    this.ws = new WebSocket(validatedDebuggerUrl(target, port));
-    this.nextId = 1;
-    this.pending = new Map();
-    this.listeners = new Map();
-    this.closed = false;
-  }
-
-  async open() {
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        try { this.ws.close(); } catch {}
-        reject(new Error("CDP WebSocket open timed out"));
-      }, 5000);
-      this.ws.addEventListener("open", () => { clearTimeout(timeout); resolve(); }, { once: true });
-      this.ws.addEventListener("error", () => { clearTimeout(timeout); reject(new Error("CDP WebSocket open failed")); }, { once: true });
-    });
-    this.ws.addEventListener("message", (event) => this.onMessage(event));
-    this.ws.addEventListener("error", () => this.close());
-    this.ws.addEventListener("close", () => {
-      this.closed = true;
-      for (const waiter of this.pending.values()) {
-        clearTimeout(waiter.timeout);
-        waiter.reject(new Error("CDP socket closed"));
-      }
-      this.pending.clear();
-    });
-    await this.send("Runtime.enable");
-    await this.send("Page.enable");
-    return this;
-  }
-
-  onMessage(event) {
-    let message;
-    try {
-      message = JSON.parse(String(event.data));
-    } catch {
-      this.close();
-      return;
-    }
-    if (message.id) {
-      const waiter = this.pending.get(message.id);
-      if (!waiter) return;
-      clearTimeout(waiter.timeout);
-      this.pending.delete(message.id);
-      if (message.error) waiter.reject(new Error(`${message.error.message} (${message.error.code})`));
-      else waiter.resolve(message.result);
-      return;
-    }
-    for (const listener of this.listeners.get(message.method) ?? []) listener(message.params ?? {});
-  }
-
-  on(method, listener) {
-    const listeners = this.listeners.get(method) ?? [];
-    listeners.push(listener);
-    this.listeners.set(method, listeners);
-  }
-
-  send(method, params = {}) {
-    if (this.closed) return Promise.reject(new Error("CDP session is closed"));
-    return new Promise((resolve, reject) => {
-      const id = this.nextId++;
-      const timeout = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`CDP command timed out: ${method}`));
-      }, 10000);
-      this.pending.set(id, { resolve, reject, timeout });
+    await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    for (let attempt = 0; ; attempt += 1) {
       try {
-        this.ws.send(JSON.stringify({ id, method, params }));
+        await fs.rename(temporary, outputPath);
+        break;
       } catch (error) {
-        clearTimeout(timeout);
-        this.pending.delete(id);
-        reject(error);
+        const transient = ["EACCES", "EBUSY", "EPERM"].includes(error?.code);
+        if (!transient || attempt >= 5) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 10 * (2 ** attempt)));
       }
-    });
-  }
-
-  async evaluate(expression) {
-    const result = await this.send("Runtime.evaluate", {
-      expression,
-      awaitPromise: true,
-      returnByValue: true,
-      userGesture: false,
-    });
-    if (result.exceptionDetails) {
-      const detail = result.exceptionDetails.exception?.description ?? result.exceptionDetails.text;
-      throw new Error(`Renderer evaluation failed: ${detail}`);
     }
-    return result.result?.value;
-  }
-
-  close() {
-    for (const waiter of this.pending.values()) {
-      clearTimeout(waiter.timeout);
-      waiter.reject(new Error("CDP session closed"));
-    }
-    this.pending.clear();
-    if (!this.closed) {
-      try { this.ws.close(); } catch {}
-    }
-    this.closed = true;
-  }
-}
-
-class BrowserIdentityAnchor {
-  constructor(url) {
-    this.ws = new WebSocket(url);
-    this.closed = false;
-    this.ws.addEventListener("close", () => { this.closed = true; });
-    this.ws.addEventListener("error", () => {
-      this.closed = true;
-      try { this.ws.close(); } catch {}
-    });
-  }
-
-  async open() {
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.close();
-        reject(new Error("CDP browser identity WebSocket open timed out"));
-      }, 5000);
-      this.ws.addEventListener("open", () => { clearTimeout(timeout); resolve(); }, { once: true });
-      this.ws.addEventListener("error", () => {
-        clearTimeout(timeout);
-        reject(new Error("CDP browser identity WebSocket open failed"));
-      }, { once: true });
-      this.ws.addEventListener("close", () => {
-        clearTimeout(timeout);
-        reject(new Error("CDP browser identity WebSocket closed during startup"));
-      }, { once: true });
-    });
-    if (this.closed) throw new Error("CDP browser identity WebSocket is already closed");
-    return this;
-  }
-
-  close() {
-    if (!this.closed) {
-      try { this.ws.close(); } catch {}
-    }
-    this.closed = true;
-  }
-}
-
-async function fetchCdpJson(port, resource) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 2000);
-  try {
-    const response = await fetch(`http://127.0.0.1:${port}${resource}`, {
-      redirect: "error",
-      signal: controller.signal,
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return await response.json();
   } finally {
-    clearTimeout(timeout);
+    await fs.rm(temporary, { force: true }).catch(() => {});
   }
 }
 
-async function listAppTargets(port, expectedBrowserId = null) {
-  const targets = await fetchCdpJson(port, "/json/list");
-  if (!Array.isArray(targets)) throw new Error("CDP target list is not an array");
-  if (expectedBrowserId) {
-    const version = await fetchCdpJson(port, "/json/version");
-    const actualBrowserId = browserIdFromVersion(version, port);
-    if (actualBrowserId !== expectedBrowserId) {
-      throw new CdpIdentityMismatchError(
-        `CDP browser identity changed from ${expectedBrowserId} to ${actualBrowserId}`,
+function assetSha256(name, bytes) {
+  let reviewedBytes = bytes;
+  if (name.endsWith(".css") || name.endsWith(".js")) {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    // Git may check text assets out with CRLF on Windows; line endings are not executable content.
+    reviewedBytes = Buffer.from(text.replace(/\r\n?/g, "\n"), "utf8");
+  }
+  return createHash("sha256").update(reviewedBytes).digest("hex");
+}
+
+export function assertAssetHashes(assets, expectedHashes = ASSET_SHA256) {
+  for (const [name, expectedHash] of Object.entries(expectedHashes)) {
+    const bytes = assets[name];
+    if (!Buffer.isBuffer(bytes)) throw new Error(`Dream Skin asset is missing: ${name}`);
+    const actualHash = assetSha256(name, bytes);
+    if (actualHash !== expectedHash) {
+      throw new Error(
+        `Dream Skin asset hash mismatch: ${name}. Review the asset diff before updating ASSET_SHA256.`,
       );
     }
   }
-  return targets.filter((item) => isValidCdpPageTarget(item, port));
-}
-
-async function connectBrowserIdentityAnchor(port, expectedBrowserId) {
-  const version = await fetchCdpJson(port, "/json/version");
-  const actualBrowserId = browserIdFromVersion(version, port);
-  if (actualBrowserId !== expectedBrowserId) {
-    throw new CdpIdentityMismatchError(
-      `CDP browser identity changed from ${expectedBrowserId} to ${actualBrowserId}`,
-    );
-  }
-  return new BrowserIdentityAnchor(validatedDebuggerUrl(version, port)).open();
 }
 
 async function loadPayload() {
-  const [css, template, art] = await Promise.all([
-    fs.readFile(path.join(root, "assets", "dream-skin.css"), "utf8"),
-    fs.readFile(path.join(root, "assets", "renderer-inject.js"), "utf8"),
-    fs.readFile(path.join(root, "assets", "dream-reference.png")),
-  ]);
+  const assetPaths = {
+    "dream-skin.css": path.join(root, "assets", "dream-skin.css"),
+    "renderer-inject.js": path.join(root, "assets", "renderer-inject.js"),
+    "dream-reference.png": path.join(root, "assets", "dream-reference.png"),
+  };
+  const [cssBytes, templateBytes, art] = await Promise.all(
+    Object.values(assetPaths).map((assetPath) => fs.readFile(assetPath)),
+  );
+  assertAssetHashes({
+    "dream-skin.css": cssBytes,
+    "renderer-inject.js": templateBytes,
+    "dream-reference.png": art,
+  });
+  const css = cssBytes.toString("utf8");
+  const template = templateBytes.toString("utf8");
+  if (/@import\b|url\(\s*["']?(?:https?:|\/\/)/i.test(css)) {
+    throw new Error("Dream Skin CSS contains a remote resource");
+  }
+  if (/\b(?:fetch|[Ww]ebSocket|XMLHttpRequest)\s*\(|\bimport\s*\(|https?:\/\//i.test(template)) {
+    throw new Error("Dream Skin renderer contains a network-capable source token");
+  }
   const artDataUrl = `data:image/png;base64,${art.toString("base64")}`;
   return template
-    .replace("__DREAM_CSS_JSON__", JSON.stringify(css))
-    .replace("__DREAM_ART_JSON__", JSON.stringify(artDataUrl));
+    .replace("__DREAM_VERSION_JSON__", JSON.stringify(SKIN_VERSION))
+    .replace("__DREAM_ART_JSON__", JSON.stringify(artDataUrl))
+    .replace("__DREAM_CSS_JSON__", JSON.stringify(css));
+}
+
+export function isUnsafeChildEnvironmentKey(key) {
+  const upperKey = String(key).toUpperCase();
+  return UNSAFE_CHILD_ENVIRONMENT_KEYS.has(upperKey) ||
+    UNSAFE_CHILD_ENVIRONMENT_PREFIXES.some((prefix) => upperKey.startsWith(prefix));
+}
+
+export function createCodexEnvironment(environment = process.env) {
+  const sanitized = { ...environment };
+  for (const key of Object.keys(sanitized)) {
+    if (isUnsafeChildEnvironmentKey(key)) delete sanitized[key];
+  }
+  return sanitized;
+}
+
+export function isPotentialCodexTarget(targetInfo) {
+  return Boolean(
+    targetInfo &&
+    targetInfo.type === "page" &&
+    typeof targetInfo.targetId === "string" &&
+    TARGET_ID_PATTERN.test(targetInfo.targetId) &&
+    typeof targetInfo.url === "string" &&
+    targetInfo.url.startsWith("app://"),
+  );
+}
+
+export function targetInfoProtocol(targetInfo) {
+  if (typeof targetInfo?.url !== "string") return null;
+  try {
+    return new URL(targetInfo.url).protocol;
+  } catch {
+    return null;
+  }
+}
+
+export function classifyTargetTransition(previousTargetInfo, currentTargetInfo) {
+  const sameTarget = typeof previousTargetInfo?.targetId === "string" &&
+    previousTargetInfo.targetId === currentTargetInfo?.targetId;
+  const scopeChanged = sameTarget && (
+    previousTargetInfo.type !== currentTargetInfo?.type ||
+    previousTargetInfo.url !== currentTargetInfo?.url
+  );
+  return {
+    sameTarget,
+    previousProtocol: targetInfoProtocol(previousTargetInfo),
+    currentProtocol: targetInfoProtocol(currentTargetInfo),
+    invalidate: scopeChanged,
+    detach: sameTarget && !isPotentialCodexTarget(currentTargetInfo),
+  };
 }
 
 async function probeSession(session) {
@@ -288,88 +210,34 @@ async function probeSession(session) {
     };
     return {
       markers,
+      appProtocol: location.protocol,
+      appIdentity: location.protocol === 'app:' && markers.shell && markers.sidebar && (markers.composer || markers.main),
       codex: location.protocol === 'app:' && markers.shell && markers.sidebar && (markers.composer || markers.main),
     };
   })()`);
-}
-
-async function connectTarget(target, port) {
-  return new CdpSession(target, port).open();
-}
-
-async function connectCodexTargets(port, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  let lastError;
-  while (Date.now() < deadline) {
-    try {
-      const targets = await listAppTargets(port, options.browserId);
-      const connected = [];
-      for (const target of targets) {
-        let session;
-        try {
-          session = await connectTarget(target, port);
-          const probe = await probeSession(session);
-          if (probe?.codex) connected.push({ target, session, probe });
-          else session.close();
-        } catch (error) {
-          session?.close();
-          lastError = error;
-        }
-      }
-      if (connected.length) return connected;
-      lastError = new Error("No page matched the expected Codex shell markers");
-    } catch (error) {
-      if (error instanceof CdpIdentityMismatchError) throw error;
-      lastError = error;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 350));
-  }
-  throw new Error(`No verified Codex renderer on 127.0.0.1:${port}: ${lastError?.message ?? "timed out"}`);
-}
-
-async function applyToSession(session, payload) {
-  return session.evaluate(payload);
-}
-
-async function removeFromSession(session) {
-  return session.evaluate(`(() => {
-    window.__CODEX_DREAM_SKIN_DISABLED__ = true;
-    const state = window.__CODEX_DREAM_SKIN_STATE__;
-    if (state?.cleanup) return state.cleanup();
-    document.documentElement?.classList.remove('codex-dream-skin');
-    document.documentElement?.style.removeProperty('--dream-art');
-    document.querySelectorAll('.dream-home').forEach((node) => node.classList.remove('dream-home'));
-    document.querySelectorAll('.dream-home-shell').forEach((node) => node.classList.remove('dream-home-shell'));
-    document.getElementById('codex-dream-skin-style')?.remove();
-    document.getElementById('codex-dream-skin-chrome')?.remove();
-    delete window.__CODEX_DREAM_SKIN_STATE__;
-    return true;
-  })()`);
-}
-
-async function verifyRemovedSession(session) {
-  return session.evaluate(`(() =>
-    !document.documentElement.classList.contains('codex-dream-skin') &&
-    !document.documentElement.style.getPropertyValue('--dream-art') &&
-    !document.querySelector('.dream-home') &&
-    !document.querySelector('.dream-home-shell') &&
-    !document.getElementById('codex-dream-skin-style') &&
-    !document.getElementById('codex-dream-skin-chrome') &&
-    !window.__CODEX_DREAM_SKIN_STATE__
-  )()`);
 }
 
 async function verifySession(session) {
   return session.evaluate(`(() => {
     const box = (node) => {
       if (!node) return null;
-      const r = node.getBoundingClientRect();
-      return { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) };
+      const rectangle = node.getBoundingClientRect();
+      return {
+        x: Math.round(rectangle.x),
+        y: Math.round(rectangle.y),
+        width: Math.round(rectangle.width),
+        height: Math.round(rectangle.height),
+      };
     };
     const home = document.querySelector('.dream-home');
     const suggestions = home?.querySelector('.group\\\\/home-suggestions') ?? null;
     const cards = suggestions ? [...suggestions.querySelectorAll('button')].map(box) : [];
     const result = {
+      appProtocol: location.protocol,
+      appIdentity: location.protocol === 'app:' &&
+        Boolean(document.querySelector('main.main-surface')) &&
+        Boolean(document.querySelector('aside.app-shell-left-panel')) &&
+        Boolean(document.querySelector('.composer-surface-chrome') || document.querySelector('[role="main"]')),
       installed: document.documentElement.classList.contains('codex-dream-skin'),
       version: window.__CODEX_DREAM_SKIN_STATE__?.version ?? null,
       expectedVersion: ${JSON.stringify(SKIN_VERSION)},
@@ -388,9 +256,10 @@ async function verifySession(session) {
         y: document.documentElement.scrollHeight > document.documentElement.clientHeight,
       },
     };
-    result.pass = result.installed && result.version === result.expectedVersion &&
-      result.stylePresent && result.chromePresent &&
-      result.chromePointerEvents === 'none' && Boolean(result.composer) && Boolean(result.sidebar) &&
+    result.pass = result.appProtocol === 'app:' && result.appIdentity &&
+      result.installed && result.version === result.expectedVersion &&
+      result.stylePresent && result.chromePresent && result.chromePointerEvents === 'none' &&
+      Boolean(result.composer) && Boolean(result.sidebar) &&
       (!result.homePresent || (Boolean(result.hero) &&
         (!result.suggestionsPresent || (result.cards.length >= 2 && result.cards.length <= 4))));
     return result;
@@ -399,233 +268,466 @@ async function verifySession(session) {
 
 async function waitForVerifiedSession(session, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
-  let lastResult;
-  let lastError;
+  let lastResult = null;
+  let lastError = null;
   while (Date.now() < deadline) {
     try {
       lastResult = await verifySession(session);
       lastError = null;
-      if (lastResult.pass) return lastResult;
+      if (lastResult?.pass) return lastResult;
     } catch (error) {
       lastError = error;
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await new Promise((resolve) => setTimeout(resolve, 400));
   }
   if (!lastResult && lastError) throw lastError;
   return lastResult;
 }
 
-async function capture(session, outputPath) {
-  await fs.mkdir(path.dirname(outputPath), { recursive: true });
-  await session.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
-  await session.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
-  const viewport = await session.evaluate("({ width: innerWidth, height: innerHeight })");
-  await session.send("Input.dispatchMouseEvent", {
-    type: "mouseMoved",
-    x: Math.round(viewport.width * 0.64),
-    y: Math.round(viewport.height * 0.62),
-    button: "none",
-  });
-  await new Promise((resolve) => setTimeout(resolve, 300));
-  const result = await session.send("Page.captureScreenshot", {
-    format: "png",
-    fromSurface: true,
-    captureBeyondViewport: false,
-  });
-  await fs.writeFile(outputPath, Buffer.from(result.data, "base64"));
+async function detachSession(connection, sessionId) {
+  try {
+    await connection.send("Target.detachFromTarget", { sessionId });
+  } catch {}
 }
 
-async function runOneShot(options) {
-  const connected = await connectCodexTargets(options.port, options.timeoutMs);
-  const payload = (options.mode === "once" || options.reload) ? await loadPayload() : null;
-  const results = [];
-  let screenshotCaptured = false;
-  try {
-    for (const { target, session, probe } of connected) {
-      try {
-        if (options.mode === "remove") await removeFromSession(session);
-        else if (options.mode === "once") await applyToSession(session, payload);
-        if (options.mode === "once") {
-          await new Promise((resolve) => setTimeout(resolve, 850));
-        }
-        if (options.reload) {
-          await session.send("Page.reload", { ignoreCache: true });
-          await new Promise((resolve) => setTimeout(resolve, 1600));
-          if (options.mode !== "remove") await applyToSession(session, payload);
-        }
-        const verified = options.mode === "remove"
-          ? await verifyRemovedSession(session)
-          : (options.reload || options.mode === "once" || options.mode === "verify")
-            ? await waitForVerifiedSession(session, options.timeoutMs)
-            : await verifySession(session);
-        results.push({ targetId: target.id, markers: probe.markers, result: verified });
-        if (options.screenshot && !screenshotCaptured) {
-          await capture(session, options.screenshot);
-          screenshotCaptured = true;
-        }
-      } finally {
-        session.close();
-      }
+async function waitForSpawn(child, timeoutMs = 10000) {
+  await new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timeout);
+      child.off("spawn", onSpawn);
+      child.off("error", onError);
+    };
+    const onSpawn = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(new Error(`Codex process could not be launched: ${error.message}`));
+    };
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error("Codex process launch timed out"));
+    }, timeoutMs);
+    child.once("spawn", onSpawn);
+    child.once("error", onError);
+  });
+}
+
+async function waitForExit(child, timeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+  return new Promise((resolve) => {
+    const finish = (exited) => {
+      clearTimeout(timeout);
+      child.off("exit", onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timeout = setTimeout(() => finish(false), timeoutMs);
+    child.once("exit", onExit);
+  });
+}
+
+async function closeChildProcess(child, connection, transport) {
+  if (!child) return;
+  if (connection) connection.close(new Error("Private CDP host is stopping"));
+  else if (transport) transport.close(new Error("Private CDP host is stopping"));
+  else {
+    for (const stream of [child.stdio?.[3], child.stdio?.[4]]) {
+      try { stream?.destroy(); } catch {}
     }
-  } finally {
-    for (const { session } of connected) session.close();
   }
-  console.log(JSON.stringify({ mode: options.mode, port: options.port, targets: results }, null, 2));
-  const failed = results.length === 0 || results.some((item) =>
-    options.mode === "remove" ? item.result !== true : !item.result?.pass);
-  if (failed) process.exitCode = 2;
+
+  if (await waitForExit(child, 5000)) return;
+  try { child.kill(); } catch {}
+  await waitForExit(child, 5000);
 }
 
 async function runWatch(options) {
-  const identityAnchor = await connectBrowserIdentityAnchor(options.port, options.browserId);
+  await fs.access(options.codexExe);
+  if (options.profilePath) await fs.mkdir(options.profilePath, { recursive: true });
+  const payload = await loadPayload();
+  const launchArguments = ["--remote-debugging-pipe"];
+  if (options.profilePath) launchArguments.push(`--user-data-dir=${options.profilePath}`);
   const sessions = new Map();
-  const targetFailures = new Map();
+  const failures = new Map();
+  let child = null;
+  let transport = null;
+  let connection = null;
+  let publishStatus = null;
   let stopping = false;
-  let listFailures = 0;
-  let lastListErrorLogAt = 0;
+  let childExited = false;
+  let firstVerified = false;
+  let zeroHealthySince = null;
+  let lastHealthCheckAt = 0;
+  let terminalError = null;
+
   const stop = () => { stopping = true; };
-  const rejectTarget = (target, baseDelayMs, error = null) => {
-    const previous = targetFailures.get(target.id) ?? { failures: 0, lastLogAt: 0 };
-    const failures = previous.failures + 1;
-    const delayMs = Math.min(30000, baseDelayMs * (2 ** Math.min(failures - 1, 4)));
-    const now = Date.now();
-    if (error && (failures === 1 || now - previous.lastLogAt >= 30000)) {
-      console.error(`[dream-skin] inject failed for ${target.id}: ${error.message}; retrying in ${delayMs}ms`);
-      previous.lastLogAt = now;
-    }
-    targetFailures.set(target.id, { failures, lastLogAt: previous.lastLogAt, until: now + delayMs });
+  const onChildExit = () => {
+    childExited = true;
+    stopping = true;
   };
-  process.on("SIGINT", stop);
-  process.on("SIGTERM", stop);
+  const onChildError = (error) => {
+    if (!terminalError) terminalError = new Error(`Codex process error: ${error.message}`);
+    stopping = true;
+  };
+
+  const invalidateEntry = (entry, targetInfo = null) => {
+    entry.verificationGeneration += 1;
+    entry.result = null;
+    entry.lastVerifiedAt = null;
+    entry.markers = null;
+    entry.appProtocol = targetInfoProtocol(targetInfo);
+    entry.appIdentity = false;
+  };
+
+  const removeSession = (targetId, expectedEntry = null) => {
+    const entry = sessions.get(targetId);
+    if (!entry || (expectedEntry && entry !== expectedEntry)) return null;
+    if (entry?.reapplyTimer) clearTimeout(entry.reapplyTimer);
+    invalidateEntry(entry);
+    sessions.delete(targetId);
+    return entry;
+  };
+
+  const isCurrentVerification = (targetId, entry, generation) =>
+    sessions.get(targetId) === entry && entry.verificationGeneration === generation;
+
+  const probeAndVerify = async (targetId, entry, { inject, timeoutMs = 10000 }) => {
+    if (entry.verifying || sessions.get(targetId) !== entry) return null;
+    entry.verifying = true;
+    invalidateEntry(entry, entry.targetInfo);
+    const generation = entry.verificationGeneration;
+    try {
+      const probe = await probeSession(entry.session);
+      if (!isCurrentVerification(targetId, entry, generation)) return null;
+      entry.markers = probe?.markers ?? null;
+      entry.appProtocol = probe?.appProtocol ?? null;
+      entry.appIdentity = probe?.appIdentity === true;
+      if (!probe?.codex || entry.appProtocol !== "app:" || !entry.appIdentity) {
+        throw new Error("Target no longer has the Codex app identity");
+      }
+
+      if (inject) await entry.session.evaluate(payload);
+      const result = inject
+        ? await waitForVerifiedSession(entry.session, timeoutMs)
+        : await verifySession(entry.session);
+      if (!isCurrentVerification(targetId, entry, generation)) return null;
+      entry.appProtocol = result?.appProtocol ?? null;
+      entry.appIdentity = result?.appIdentity === true;
+      if (!result?.pass || entry.appProtocol !== "app:" || !entry.appIdentity) {
+        throw new Error(inject
+          ? "Injected renderer did not pass visual safety checks"
+          : "Renderer verification no longer passes");
+      }
+      entry.result = result;
+      entry.lastVerifiedAt = new Date().toISOString();
+      return result;
+    } finally {
+      entry.verifying = false;
+    }
+  };
+
+  const scheduleReapply = (targetId, entry) => {
+    if (entry.reapplyTimer) clearTimeout(entry.reapplyTimer);
+    entry.reapplyTimer = setTimeout(() => {
+      entry.reapplyTimer = null;
+      if (entry.verifying) {
+        scheduleReapply(targetId, entry);
+        return;
+      }
+      probeAndVerify(targetId, entry, { inject: true, timeoutMs: 15000 }).catch((error) => {
+        console.error(`[dream-skin] private-pipe reinjection failed for ${targetId}: ${error.message}`);
+        const removed = removeSession(targetId, entry);
+        if (removed) detachSession(connection, removed.sessionId).catch(() => {});
+      });
+    }, 250);
+  };
+
+  const handleTargetInfoChanged = (targetInfo) => {
+    const targetId = targetInfo?.targetId;
+    if (!targetId) return;
+    failures.delete(targetId);
+    const entry = sessions.get(targetId);
+    if (!entry) return;
+    const transition = classifyTargetTransition(entry.targetInfo, targetInfo);
+    entry.targetInfo = targetInfo;
+    if (!isPotentialCodexTarget(targetInfo)) {
+      invalidateEntry(entry, targetInfo);
+      const removed = removeSession(targetId, entry);
+      if (removed) detachSession(connection, removed.sessionId).catch(() => {});
+      return;
+    }
+    if (transition.invalidate) {
+      invalidateEntry(entry, targetInfo);
+      scheduleReapply(targetId, entry);
+    }
+  };
+
+  const handleEvent = (event) => {
+    if (event.method === "Target.targetDestroyed" && event.params?.targetId) {
+      removeSession(event.params.targetId);
+      failures.delete(event.params.targetId);
+      return;
+    }
+    if (event.method === "Target.detachedFromTarget" && event.params?.sessionId) {
+      for (const [targetId, entry] of sessions) {
+        if (entry.sessionId === event.params.sessionId) removeSession(targetId);
+      }
+      return;
+    }
+    if (event.method === "Target.targetInfoChanged" && event.params?.targetInfo?.targetId) {
+      handleTargetInfoChanged(event.params.targetInfo);
+      return;
+    }
+    if (event.method === "Page.loadEventFired" && event.sessionId) {
+      for (const [targetId, entry] of sessions) {
+        if (entry.sessionId === event.sessionId) {
+          invalidateEntry(entry, entry.targetInfo);
+          scheduleReapply(targetId, entry);
+        }
+      }
+    }
+  };
+
+  const attachTarget = async (targetInfo) => {
+    if (!isPotentialCodexTarget(targetInfo) || sessions.has(targetInfo.targetId)) return;
+    const failedUntil = failures.get(targetInfo.targetId)?.until ?? 0;
+    if (failedUntil > Date.now()) return;
+
+    let sessionId = null;
+    let entry = null;
+    try {
+      const attached = await connection.send("Target.attachToTarget", {
+        targetId: targetInfo.targetId,
+        flatten: true,
+      });
+      sessionId = attached.sessionId;
+      if (typeof sessionId !== "string" || !sessionId) throw new Error("Target returned no flattened session ID");
+      const session = new CdpPipeSession(connection, sessionId);
+      await session.send("Runtime.enable");
+      await session.send("Page.enable");
+      entry = {
+        session,
+        sessionId,
+        targetInfo,
+        markers: null,
+        result: null,
+        lastVerifiedAt: null,
+        appProtocol: targetInfoProtocol(targetInfo),
+        appIdentity: false,
+        reapplyTimer: null,
+        verifying: false,
+        verificationGeneration: 0,
+      };
+      sessions.set(targetInfo.targetId, entry);
+      const result = await probeAndVerify(targetInfo.targetId, entry, { inject: true, timeoutMs: 20000 });
+      if (!result?.pass) throw new Error("Target verification was superseded");
+      failures.delete(targetInfo.targetId);
+      console.log(`[dream-skin] injected verified Codex target ${targetInfo.targetId} over private pipe`);
+    } catch (error) {
+      if (entry) removeSession(targetInfo.targetId, entry);
+      if (sessionId) await detachSession(connection, sessionId);
+      const previous = failures.get(targetInfo.targetId)?.count ?? 0;
+      const count = previous + 1;
+      const delay = Math.min(30000, 1500 * (2 ** Math.min(count - 1, 4)));
+      failures.set(targetInfo.targetId, { count, until: Date.now() + delay });
+      if (count === 1 || count % 5 === 0) {
+        console.error(`[dream-skin] target ${targetInfo.targetId} was not ready; retrying privately in ${delay}ms`);
+      }
+    }
+  };
+
+  const reconcileTargets = async () => {
+    const response = await connection.send("Target.getTargets", { filter: [{ type: "page" }] });
+    const targetInfos = Array.isArray(response.targetInfos) ? response.targetInfos : [];
+    const activeTargets = new Map(targetInfos
+      .filter((target) => typeof target?.targetId === "string")
+      .map((target) => [target.targetId, target]));
+    for (const [targetId, entry] of [...sessions]) {
+      const targetInfo = activeTargets.get(targetId);
+      if (!targetInfo || !isPotentialCodexTarget(targetInfo)) {
+        const removed = removeSession(targetId, entry);
+        if (removed) detachSession(connection, removed.sessionId).catch(() => {});
+      } else {
+        const transition = classifyTargetTransition(entry.targetInfo, targetInfo);
+        entry.targetInfo = targetInfo;
+        if (transition.invalidate) {
+          invalidateEntry(entry, targetInfo);
+          scheduleReapply(targetId, entry);
+        }
+      }
+    }
+    for (const targetInfo of targetInfos) await attachTarget(targetInfo);
+  };
 
   try {
-    const payload = await loadPayload();
-    while (!stopping) {
-      if (identityAnchor.closed) {
-        console.error("[dream-skin] original CDP browser identity closed; watcher is stopping instead of reconnecting");
-        process.exitCode = 3;
-        break;
-      }
-      let targets = [];
-      try {
-        targets = await listAppTargets(options.port);
-        listFailures = 0;
-      } catch (error) {
-        listFailures += 1;
-        const retryMs = Math.min(10000, 1000 * (2 ** Math.min(listFailures - 1, 4)));
-        if (listFailures === 1 || Date.now() - lastListErrorLogAt >= 30000) {
-          console.error(`[dream-skin] ${new Date().toISOString()} ${error.message}; retrying in ${retryMs}ms`);
-          lastListErrorLogAt = Date.now();
-        }
-        await new Promise((resolve) => setTimeout(resolve, retryMs));
-        continue;
-      }
-
-      const activeIds = new Set(targets.map((target) => target.id));
-      for (const id of targetFailures.keys()) {
-        if (!activeIds.has(id)) targetFailures.delete(id);
-      }
-      for (const [id, session] of sessions) {
-        if (!activeIds.has(id) || session.closed) {
-          session.close();
-          sessions.delete(id);
-          targetFailures.delete(id);
-        }
-      }
-
-      for (const target of targets) {
-        if (identityAnchor.closed) break;
-        if (sessions.has(target.id)) continue;
-        if ((targetFailures.get(target.id)?.until ?? 0) > Date.now()) continue;
-        let session;
-        try {
-          session = await connectTarget(target, options.port);
-          if (identityAnchor.closed) throw new CdpIdentityMismatchError("Original CDP browser identity closed");
-          const probe = await probeSession(session);
-          if (!probe?.codex) {
-            rejectTarget(target, 5000);
-            session.close();
-            continue;
-          }
-          let lastReinjectErrorLogAt = 0;
-          session.on("Page.loadEventFired", () => {
-            setTimeout(() => applyToSession(session, payload).catch((error) => {
-              if (Date.now() - lastReinjectErrorLogAt >= 30000) {
-                console.error(`[dream-skin] reinject failed for ${target.id}: ${error.message}`);
-                lastReinjectErrorLogAt = Date.now();
-              }
-            }), 250);
-          });
-          if (identityAnchor.closed) throw new CdpIdentityMismatchError("Original CDP browser identity closed");
-          await applyToSession(session, payload);
-          sessions.set(target.id, session);
-          targetFailures.delete(target.id);
-          console.log(`[dream-skin] injected target ${target.id}`);
-        } catch (error) {
-          session?.close();
-          if (identityAnchor.closed || error instanceof CdpIdentityMismatchError) break;
-          rejectTarget(target, 2500, error);
-        }
-      }
-      await new Promise((resolve) => setTimeout(resolve, 1200));
+    process.on("SIGINT", stop);
+    process.on("SIGTERM", stop);
+    child = spawn(options.codexExe, launchArguments, {
+      shell: false,
+      detached: false,
+      windowsHide: false,
+      cwd: path.dirname(options.codexExe),
+      env: createCodexEnvironment(),
+      stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"],
+    });
+    child.once("exit", onChildExit);
+    child.on("error", onChildError);
+    await waitForSpawn(child);
+    if (!child.stdio[3]?.write || !child.stdio[4]?.on) {
+      throw new Error("Codex did not inherit the required private CDP pipes");
     }
+
+    transport = new NulDelimitedPipeTransport(child.stdio[3], child.stdio[4]);
+    connection = new CdpPipeConnection(transport);
+    connection.onEvent(handleEvent);
+    publishStatus = async (healthy, error = null) => {
+      const targets = [...sessions.entries()]
+        .filter(([, entry]) => entry.markers && entry.result && entry.lastVerifiedAt &&
+          typeof entry.appProtocol === "string" && typeof entry.appIdentity === "boolean")
+        .map(([targetId, entry]) => ({
+          targetId,
+          markers: entry.markers,
+          result: entry.result,
+          lastVerifiedAt: entry.lastVerifiedAt,
+          appProtocol: entry.appProtocol,
+          appIdentity: entry.appIdentity,
+        }));
+      await writeJsonAtomically(options.statusPath, {
+        schemaVersion: 1,
+        transport: "pipe",
+        sessionId: options.sessionId,
+        version: SKIN_VERSION,
+        hostPid: process.pid,
+        codexPid: child.pid,
+        healthy,
+        error,
+        targets,
+        updatedAt: new Date().toISOString(),
+      });
+    };
+
+    await writeJsonAtomically(options.handshakePath, {
+      schemaVersion: 1,
+      transport: "pipe",
+      sessionId: options.sessionId,
+      hostPid: process.pid,
+      codexPid: child.pid,
+      createdAt: new Date().toISOString(),
+    });
+    await connection.send("Browser.getVersion");
+    await connection.send("Target.setDiscoverTargets", { discover: true });
+    const startupDeadline = Date.now() + options.timeoutMs;
+
+    while (!stopping && !connection.closed) {
+      await reconcileTargets();
+      const now = Date.now();
+      if (now - lastHealthCheckAt >= 5000) {
+        lastHealthCheckAt = now;
+        for (const [targetId, entry] of [...sessions]) {
+          if (entry.verifying) continue;
+          try {
+            await probeAndVerify(targetId, entry, { inject: false });
+          } catch {
+            const removed = removeSession(targetId, entry);
+            if (removed) await detachSession(connection, removed.sessionId);
+          }
+        }
+      }
+
+      const healthy = [...sessions.values()].some((entry) =>
+        entry.result?.pass && entry.appProtocol === "app:" && entry.appIdentity === true && entry.lastVerifiedAt);
+      if (healthy) {
+        firstVerified = true;
+        zeroHealthySince = null;
+      } else if (firstVerified && zeroHealthySince === null) {
+        zeroHealthySince = now;
+      }
+      await publishStatus(healthy);
+      if (!firstVerified && Date.now() >= startupDeadline) {
+        throw new Error("No verified Codex renderer became available through the private CDP pipe");
+      }
+      if (firstVerified && zeroHealthySince !== null &&
+          Date.now() - zeroHealthySince >= ZERO_HEALTHY_TARGET_GRACE_MS) {
+        throw new Error("No verified Codex renderer remained after the 30-second grace period");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    if (connection.closed && !stopping) {
+      throw new Error("Private CDP pipe closed unexpectedly");
+    }
+  } catch (error) {
+    terminalError = error;
+    throw error;
   } finally {
-    identityAnchor.close();
-    for (const session of sessions.values()) session.close();
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+    for (const [targetId, entry] of sessions) {
+      if (entry.reapplyTimer) clearTimeout(entry.reapplyTimer);
+      if (connection && !connection.closed) await detachSession(connection, entry.sessionId);
+      sessions.delete(targetId);
+    }
+    await closeChildProcess(child, connection, transport);
+    child?.off("error", onChildError);
+    const finalMessage = terminalError?.message ?? (childExited ? "Codex closed" : "Private pipe host stopped");
+    if (publishStatus) await publishStatus(false, finalMessage).catch(() => {});
   }
 }
 
-const options = parseArgs(process.argv.slice(2));
-if (options.mode === "self-test") {
-  const valid = validatedDebuggerUrl({ webSocketDebuggerUrl: `ws://127.0.0.1:${options.port}/devtools/page/test` }, options.port);
-  const browserId = browserIdFromVersion({
-    webSocketDebuggerUrl: `ws://127.0.0.1:${options.port}/devtools/browser/test-browser`,
-  }, options.port);
-  const invalid = [
-    "ws://example.com/devtools/page/test",
-    `ws://127.0.0.1:${options.port + 1}/devtools/page/test`,
-    `wss://127.0.0.1:${options.port}/devtools/page/test`,
-    `ws://user@127.0.0.1:${options.port}/devtools/page/test`,
-    `ws://127.0.0.1:${options.port}/unexpected/test`,
-    `ws://127.0.0.1:${options.port}/devtools/page/test?query=1`,
+async function runSelfTest() {
+  const safeTarget = { type: "page", targetId: "page-123", url: "app://codex/" };
+  const unsafeTargets = [
+    { ...safeTarget, type: "other" },
+    { ...safeTarget, targetId: "page 123" },
+    { ...safeTarget, url: "https://example.com/" },
   ];
-  for (const value of invalid) {
-    let rejected = false;
-    try { validatedDebuggerUrl({ webSocketDebuggerUrl: value }, options.port); } catch { rejected = true; }
-    if (!rejected) throw new Error(`CDP URL validation accepted an unsafe URL: ${value}`);
+  if (!isPotentialCodexTarget(safeTarget) || unsafeTargets.some(isPotentialCodexTarget)) {
+    throw new Error("Private-pipe target validation self-test failed");
   }
-  const invalidBrowserUrls = [
-    `ws://127.0.0.1:${options.port}/devtools/page/not-a-browser`,
-    `ws://127.0.0.1:${options.port}/devtools/browser/bad%20id`,
-    `ws://127.0.0.1:${options.port}/devtools/browser/test?query=1`,
-  ];
-  for (const value of invalidBrowserUrls) {
-    let rejected = false;
-    try { browserIdFromVersion({ webSocketDebuggerUrl: value }, options.port); } catch { rejected = true; }
-    if (!rejected) throw new Error(`Browser identity validation accepted an unsafe URL: ${value}`);
+  const unsafeNavigation = classifyTargetTransition(safeTarget, unsafeTargets[2]);
+  if (!unsafeNavigation.invalidate || !unsafeNavigation.detach ||
+      unsafeNavigation.previousProtocol !== "app:" || unsafeNavigation.currentProtocol !== "https:") {
+    throw new Error("Private-pipe navigation scope self-test failed");
   }
-  const validPageTarget = {
-    id: "page-test",
-    type: "page",
-    url: "app://codex/",
-    webSocketDebuggerUrl: `ws://127.0.0.1:${options.port}/devtools/page/page-test`,
-  };
-  const invalidPageTargets = [
-    { ...validPageTarget, webSocketDebuggerUrl: `ws://127.0.0.1:${options.port}/devtools/browser/page-test` },
-    { ...validPageTarget, id: "other-page" },
-    { ...validPageTarget, id: 123 },
-    { ...validPageTarget, type: "other" },
-  ];
-  if (!valid || browserId !== "test-browser" || !isValidCdpPageTarget(validPageTarget, options.port) ||
-      invalidPageTargets.some((item) => isValidCdpPageTarget(item, options.port))) {
-    throw new Error("CDP URL and target validation self-test failed");
+  const sanitized = createCodexEnvironment({
+    PATH: "safe",
+    Node_Options: "--require attacker.js",
+    ELECTRON_RUN_AS_NODE: "1",
+    NODE_PATH: "C:\\untrusted",
+    Chrome_User_Data_Dir: "C:\\untrusted-profile",
+    OPENSSL_CONF: "C:\\untrusted-openssl.cnf",
+    HTTPS_PROXY: "http://untrusted.invalid",
+    LD_PRELOAD: "untrusted.dll",
+  });
+  if (sanitized.PATH !== "safe" || Object.keys(sanitized).some((key) =>
+    isUnsafeChildEnvironmentKey(key))) {
+    throw new Error("Codex child environment sanitization self-test failed");
   }
-  console.log(JSON.stringify({ pass: true, version: SKIN_VERSION, test: "loopback-cdp-validation" }));
-} else if (options.mode === "check-payload") {
-  const payload = await loadPayload();
-  if (payload.includes("__DREAM_CSS_JSON__") || payload.includes("__DREAM_ART_JSON__")) {
-    throw new Error("Payload placeholders were not fully replaced");
+  console.log(JSON.stringify({ pass: true, version: SKIN_VERSION, transport: "pipe" }));
+}
+
+export async function main(argv = process.argv.slice(2)) {
+  const options = parseArgs(argv);
+  if (options.mode === "self-test") {
+    await runSelfTest();
+  } else if (options.mode === "check-payload") {
+    const payload = await loadPayload();
+    if (payload.includes("__DREAM_CSS_JSON__") || payload.includes("__DREAM_ART_JSON__") ||
+        payload.includes("__DREAM_VERSION_JSON__")) {
+      throw new Error("Payload placeholders were not fully replaced");
+    }
+    console.log(JSON.stringify({
+      pass: true,
+      version: SKIN_VERSION,
+      payloadBytes: Buffer.byteLength(payload),
+      assetSha256: ASSET_SHA256,
+    }));
+  } else {
+    await runWatch(options);
   }
-  console.log(JSON.stringify({ pass: true, version: SKIN_VERSION, payloadBytes: Buffer.byteLength(payload) }));
-} else if (options.mode === "watch") await runWatch(options);
-else await runOneShot(options);
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await main();
+}
